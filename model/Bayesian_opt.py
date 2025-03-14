@@ -18,12 +18,8 @@ import pandas as pd
 import ast
 import numpy as np
 import matplotlib.pyplot as plt
-torch.manual_seed(0)
-torch.cuda.manual_seed(0)
-np.random.seed(0)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-#%%
+import random
+
 class ModelTrainer(object):
     def __init__(self, params: dict, data: dict, data_container, data_loader,data_generator ):
         self.params = params 
@@ -52,19 +48,14 @@ class ModelTrainer(object):
             raise NotImplementedError('Invalid optimizer name.')
         return optimizer
 
-    def train(self, lr, hidden_unit):
-        '''
-        torch.manual_seed(0)
-        torch.cuda.manual_seed(0)
-        np.random.seed(0)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        '''
+    def train(self, lr, hidden_unit,n_head,lstm_layer):
         self.task_level = 1
         self.params["learn_rate"] = lr
         self.params["hidden_unit"] = int(round(hidden_unit))
-        self.model = Multi_model.Model(num_feature = self.params['N'], in_len=self.params['obs_len'],out_len=self.params['pred_len'],layers=2
-                                    , dropout=0.3, hidden_unit=params["hidden_unit"], model = self.params["model"]).to(self.params['GPU'])
+        self.params["n_head"] = int(round(n_head))
+        self.params["layer"] = int(round(lstm_layer))
+        self.model = Multi_model.Model(num_feature = self.params['N'], in_len=self.params['obs_len'],out_len=self.params['pred_len'],layers=self.params["layer"],
+                                    dropout=0.3, hidden_unit=params["hidden_unit"], model = self.params["model"], n_head=self.params["n_head"]).to(self.params['GPU'])
         self.criterion = self.get_loss()
         self.optimizer = self.get_optimizer()
         val_loss = np.inf
@@ -78,39 +69,39 @@ class ModelTrainer(object):
             starttime = datetime.now()
             running_loss = {mode: 0.0 for mode in ["train","validate","test"]}
             for mode in ["train","validate"]:
-                
                 if mode == 'train':
                     self.model.train()
                 else:
                     self.model.eval()
                 step = 0
-                for x_node, x_known, x_SIR, y_true, matrix in self.data_loader[mode]:
+                for x_node, x_SIR, y_true, matrix in self.data_loader[mode]:
                     #shape of X : [batch, input_time ,feature]
                     #shape of y : [batch, 1 or pred_time]
+                    #print(y_true.shape) # batch, pred_len, 16, 4 
                     with torch.set_grad_enabled(mode=(mode == 'train')):
-                        beta,y_pred,h = self.model(x_node, x_known, x_SIR, matrix)
+
+                        beta,y_pred,h = self.model(x_node, x_SIR, matrix)
                     if self.params["model"]=="compartment":
-                        loss = self.criterion(y_pred, y_true)
+                        loss = self.criterion(y_pred[:,:,:,:], y_true[:,:,:,:])
+
                     else:
                             if mode == 'train':
                                 self.optimizer.zero_grad()
-                                if (epoch % 2 == 0 and self.task_level <= self.params["pred_len"]):
-                                    self.task_level += 1
-                                    loss = self.criterion(y_pred[:, :self.task_level],
-                                                    y_true[:, :self.task_level])
-                                else:
-                                    loss = self.criterion(y_pred, y_true)
+                                loss = self.criterion(y_pred[:,:,:,:], y_true[:,:,:,:])
                                 loss.backward()
                                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5)
                                 self.optimizer.step()
                             else:
-                                loss = self.criterion(y_pred, y_true)
+                                if params["model"] == "deep_learning":
+                                    y_pred = self.data_generator.prepro.inverse_transform(y_pred.detach())
+                                    y_true = self.data_generator.prepro.inverse_transform(y_true.detach())
+                                loss = self.criterion(y_pred[:,:,:,:], y_true[:,:,:,:])
                     running_loss[mode] += loss * y_true.shape[0]  # loss reduction='mean': batchwise average
                     step += y_true.shape[0]
                 
                 if mode == 'validate':
                     epoch_val_loss = running_loss[mode] / step
-                    if epoch_val_loss < val_loss- 0.1:
+                    if epoch_val_loss < val_loss :
                         val_loss = epoch_val_loss
                         patience_count = early_stop
                         print(f'Epoch {epoch}, validation loss drops from {val_loss:.5} to {epoch_val_loss:.5}. '
@@ -128,9 +119,9 @@ class ModelTrainer(object):
         self.epoch_dict[float(val_loss)]  = check_epoch
         self.model.eval()
         step=0
-        for x_node, x_known, x_SIR, y_true, matrix in self.data_loader[mode]:
-            b,y_pred,h = self.model(x_node, x_known, x_SIR, matrix)
-            loss =  self.criterion(y_true, y_pred) #self.criterionself.criterion(y_I, pred_I) +
+        for x_node, x_SIR, y_true, matrix in self.data_loader[mode]:
+            b,y_pred,h = self.model(x_node, x_SIR, matrix)
+            loss =  self.criterion(y_true[:,:,:,:], y_pred[:,:,:,:]) #self.criterionself.criterion(y_I, pred_I) +
             running_loss["test"] += loss * y_true.shape[0]
             step += y_true.shape[0]  # loss reduction='mean': batchwise average
         self.test_loss_dict[float(val_loss)] = (running_loss["test"] / step).item()
@@ -157,23 +148,23 @@ def Run_One_Model(params,parameter_bound):
     data_loader = data_generator.get_data_loader(data=data,params=params)
     trainer = ModelTrainer(params=params, data=data, data_container=data_input, data_loader=data_loader,data_generator =data_generator)
     #이제 여러번 돌릴거임
-    bayes_optimizer  = BayesianOptimization(f = trainer.train, pbounds = parameter_bound)           
+    bayes_optimizer  = BayesianOptimization(f = trainer.train, pbounds = parameter_bound, random_state=0)           
     utility = UtilityFunction(kind="ei", xi=0.01)
-    #logger = JSONLogger(path="{}/hyper/{}_{}_model_{}_pred.json".format(params["output_dir"],len(params['node']),params["model"],params["pred_len"]))
-    #bayes_optimizer.subscribe(Events.OPTIMIZATION_STEP, logger) 
     bayes_optimizer.suggest(utility)
     bayes_optimizer.set_gp_params(alpha=1e-4)#alpha가 커진다=uncertainty의 영향을 더 고려한다
     bayes_optimizer.maximize(init_points=10,n_iter=20)             
     print("run_bayes_optimizer_complete") 
-    columns=["model","pred_len","epoch","lr","hidden_unit","Val_loss","Test_loss"]
+    columns=["model","pred_len","epoch","lr","n_head","lstm_layer","hidden_unit","Val_loss","Test_loss"]
     val_loss = -bayes_optimizer.max["target"]
     lr = bayes_optimizer.max["params"]["lr"]
+    n_head = int(round(bayes_optimizer.max["params"]["n_head"]))
+    lstm_layer = int(round(bayes_optimizer.max["params"]["lstm_layer"]))
     hidden_unit = int(round(bayes_optimizer.max["params"]["hidden_unit"]))
     epoch = int(trainer.get_epoch()[val_loss])
     Best_Net = trainer.get_model()[val_loss]
     test_loss = trainer.get_test_loss()[val_loss]
 
-    Result = [params["model"],params["pred_len"],epoch,lr,hidden_unit,val_loss,test_loss]
+    Result = [params["model"],params["pred_len"],epoch,lr,n_head,lstm_layer,hidden_unit,val_loss,test_loss]
     df =  pd.DataFrame(data=[Result], columns=columns)
     #df.to_csv("{}/best_models/{}_hyperparameter_{}_model_{}_pred.csv".format(params["output_dir"],len(params['node']),params["model"],params["pred_len"]))
     #model_save_path = "{}/best_models/hyper/{}_model_{}_model_{}_pred.pth".format(params["output_dir"],len(params['node']),params["model"],params["pred_len"])
@@ -188,19 +179,24 @@ def Run_One_Model(params,parameter_bound):
     return Result
     
 def Bayesian_main(params):
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    torch.cuda.manual_seed_all(0) 
 
-    parameter_bound = {"lr": (0.0001, 0.1), "hidden_unit": (10,20)}
-    All_Result = pd.DataFrame(columns=["model", "pred_len", "epoch", "lr", "hidden_unit", "Val_loss", "Test_loss"])
-    for pred_len in [1]:
+    parameter_bound = {"lr": (0.0001, 0.01), "hidden_unit": (2,5),"n_head":(1,2),"lstm_layer":(1,2)}
+    All_Result = pd.DataFrame(columns=["model", "pred_len", "epoch", "lr", "n_head","lstm_layer","hidden_unit", "Val_loss", "Test_loss"])
+    for pred_len in [3]:
         params["pred_len"] = pred_len
-        for model in ["MPUGAT","MPGAT","C_ij"]: #"compartment","deep_learning",
+        for model in ["MPGAT","deep_learning",  "C_ij"]: #"MPGAT","deep_learning",  "C_ij"
             params["model"] = model
             start_time = datetime.now()
             Result = Run_One_Model(params, parameter_bound)
             All_Result.loc[len(All_Result)] = Result  # Append the result 
             print('Model training completed. Time:', datetime.now() - start_time)
             All_Result.to_csv("./hyper/Hyperparameter.csv")  # Save results after all iterations
-        All_Result.loc[len(All_Result)]  = ["compartment",pred_len,1,1,1,1,1]
+        All_Result.loc[len(All_Result)] = ["compartment",pred_len,1,1,1,1,1,1,1]
         All_Result.to_csv("./hyper/Hyperparameter.csv")
     print(All_Result)
     return All_Result
@@ -218,9 +214,11 @@ def Run_seed(Result, params):
         # Update the parameters with the current row values
         params.update({
             "model": row["model"],
-            "pred_len": row["pred_len"],
+            "n_head": row["n_head"],
+            "layer" : row["lstm_layer"],
             "lr": row["lr"],
-            "hidden_unit": row["hidden_unit"]
+            "hidden_unit": row["hidden_unit"],
+            "pred_len":row["pred_len"]
         })
         
         # Load data
@@ -240,34 +238,35 @@ def Run_seed(Result, params):
             seed_num = 30
         
         # Initialize storage for predictions, actuals, etc.
-        save["train"] = np.zeros((seed_num, data_generator.len["train"], params["pred_len"], 16, 4))
-        save["validate"] = np.zeros((seed_num, data_generator.len["validate"], params["pred_len"], 16, 4))
-        save["test"] = np.zeros((seed_num, data_generator.len["test"], params["pred_len"], 16, 4))
+        save["train"] = np.zeros((seed_num, data_generator.len["train"], params["pred_len"], 16, 4,4))
+        save["validate"] = np.zeros((seed_num, data_generator.len["validate"], params["pred_len"], 16,4, 4))
+        save["test"] = np.zeros((seed_num, data_generator.len["test"], params["pred_len"], 16,4, 4))
         save["contact"] = np.zeros((seed_num, data_generator.len["train"] + data_generator.len["validate"] + data_generator.len["test"], 16, 16))
         
         for seed in range(seed_num):
             # Set seeds for reproducibility
+            random.seed(seed)
+            np.random.seed(seed)
             torch.manual_seed(seed)
             torch.cuda.manual_seed(seed)
             np.random.seed(seed)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
             
             # Train the model and get the network with the lowest validation loss
-            val_loss = -trainer.train(params["lr"], params["hidden_unit"])
+            val_loss = -trainer.train(params["lr"], params["hidden_unit"],params["n_head"],params["layer"])
             Net = trainer.get_model()[val_loss]
             contact = []
             
             for mode in ["train", "validate","test"]:
                 predictions, actuals, beta_pred = [], [], []
                 
-                for x_node, x_known, x_SIR, y_true, matrix in data_loader[mode]:
+                for x_node, x_SIR, y_true, matrix in data_loader[mode]:
                     # Forward pass
-                    b, y_pred, h = Net(x_node, x_known, x_SIR, matrix)
+                    b, y_pred, h = Net(x_node, x_SIR, matrix)
                     # Process predictions and actuals based on model type
                     if params["model"] == "deep_learning":
                         predictions.append(data_generator.prepro.inverse_transform(y_pred.detach()).cpu().numpy())
                         actuals.append(data_generator.prepro.inverse_transform(y_true).cpu().numpy())
+
                     else:
                         predictions.append(y_pred.cpu().detach().numpy())
                         actuals.append(y_true.cpu().detach().numpy())
@@ -281,26 +280,28 @@ def Run_seed(Result, params):
                 beta_pred = np.concatenate(beta_pred)
                 
                 # Store predictions, actuals, and beta_pred
-                save[mode][seed, :, :, :, 0] = predictions
-                save[mode][seed, :, :, :, 1] = actuals
-                save[mode][seed, :, :, :, 2] = beta_pred
+                save[mode][seed, :, :,:, :, 0] = predictions
+                save[mode][seed, :, :,:, :, 1] = actuals
+                save[mode][seed, :, :,:, 0, 2] = beta_pred
                 
                 # Calculate metrics for all modes
-                for ac in range(params["pred_len"]):
-                    mse, rmse, mae = compute_metrics(predictions[:, ac, :], actuals[:, ac, :])
-                    model_results.append({
-                        'pred_len': params['pred_len'], 
-                        'model': params['model'], 
-                        'time_step': ac + 1,
-                        'seed': seed, 
-                        'mode': mode,  # Store the mode information
-                        'mse': mse, 
-                        'rmse': rmse, 
-                        'mae': mae
-                    })
+                mse, rmse, mae = compute_metrics(predictions[:, -1,:, :], actuals[:, -1,:, :])
+                model_results.append({
+                    'pred_len': params['pred_len'], 
+                    'model': params['model'], 
+                    'seed': seed, 
+                    'mode': mode,  # Store the mode information
+                    'mse': mse, 
+                    'rmse': rmse, 
+                    'mae': mae
+                })
                 
             # Concatenate contact information
-            contact = np.concatenate(contact)
+            
+            contact = np.concatenate(contact, axis=0)
+            contact_mean = np.mean(contact, axis=0)  # (city, city)
+            if params["model"] == "MPUGAT":
+                np.savetxt(f"./seed/contact_mean_{params['pred_len']}.csv", contact_mean, delimiter=",")
             save["contact"][seed, :, :, :] = contact
         
         # Save prediction and actual data to file
@@ -309,7 +310,7 @@ def Run_seed(Result, params):
         
         # Create a DataFrame from the results and calculate summary statistics
         df_metrics = pd.DataFrame(model_results)
-        summary = df_metrics.groupby(['time_step', 'mode']).agg({
+        summary = df_metrics.groupby(['mode']).agg({
             'mse': ['mean', 'std'], 
             'rmse': ['mean', 'std'], 
             'mae': ['mean', 'std']
@@ -326,7 +327,7 @@ def Run_seed(Result, params):
     # Concatenate all results into a single DataFrame
     results_df = pd.concat(results)
     results_df.reset_index(inplace=True)
-    results_df.set_index(['time_step', 'mode', 'model', 'pred_len'], inplace=True)
+    results_df.set_index(['mode', 'model', 'pred_len'], inplace=True)
     
     # Save the summary results to a CSV file
     results_df.to_csv('./seed/model_performance_summary.csv')
@@ -336,20 +337,23 @@ def Run_seed(Result, params):
 if __name__ == '__main__':
 
     params =  {}
-    params["N"] = 2
-    params["GPU"] = "cuda:0"#'cuda:0'
+    params["N"] = 6
+    params["GPU"] = "cpu"#'cuda:0'""
     params["input_dir"] = '../data'
-    params["split_ratio"] = [9, 1, 0]
-    params["batch_size"] = 10
+    params["split_ratio"] = [8, 1, 1]
+    params["batch_size"] = 30
     params["num_epochs"] = 1000
     params["loss"] = 'MAE'
     params["optimizer"] = 'Adam'
     params["weight_decay"] = 1e-9
-    params["model_name"] = "lstm"         #Deep learning model name
-    params["obs_len"] = 14
+    params["obs_len"] = 15
     
     Result = Bayesian_main(params)
     Result = pd.read_csv("./hyper/Hyperparameter.csv")
     Run_seed(Result,params)
 
-# %%
+
+ 
+ 
+ 
+    # %%
